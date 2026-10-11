@@ -5,16 +5,20 @@
 
 #include <cuda_bf16.h>
 #include <cuda_fp16.h>
+#include <type_traits>
 
 #include "core/providers/cuda/cu_inc/common.cuh"
 #include "contrib_ops/cuda/quantization/matmul_4bits_common.cuh"
 #include "contrib_ops/cuda/quantization/matmul_4bits_m1.cuh"
+#include "contrib_ops/cuda/quantization/matmul_4bits_m1_direct.h"
+// cuda_common.h (through common.cuh) defines SHARED_PROVIDER before this include.
+#include "core/platform/env_var_utils.h"
 
 namespace onnxruntime {
 namespace contrib {
 namespace cuda {
 
-template <class T, int block_size, bool has_zero_point>
+template <class T, int block_size, bool has_zero_point, bool direct_scales = false, int max_unroll = 16>
 __global__ void __launch_bounds__(kWarpSize* kColsPerThreadBlock) MatMulFloat4BitsKernelM1(
     T* output,
     const T* a_data,
@@ -32,31 +36,39 @@ __global__ void __launch_bounds__(kWarpSize* kColsPerThreadBlock) MatMulFloat4Bi
   const int n_id = n_block_id * kColsPerThreadBlock + warp_id;
   constexpr int k_per_iter = kWarpSize * kElementsPerThreadPerIteration;
 
-  extern __shared__ char shared_buffer[];
-  T* b_scale_vec = (T*)shared_buffer;
-  int offset = n_block_id * kColsPerThreadBlock * blocks_per_K;
-  for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * blocks_per_K;
-       i += kColsPerThreadBlock * kWarpSize) {
-    b_scale_vec[i] = scales_data[offset + i];
-  }
-
-  uint8_t* b_zp_vec;
-  (void)b_zp_vec;
-  if constexpr (has_zero_point) {
-    b_zp_vec = reinterpret_cast<uint8_t*>(b_scale_vec + kColsPerThreadBlock * blocks_per_K);
-    const int b_zp_k = (blocks_per_K + 1) / 2;
-    int zp_offset = n_block_id * kColsPerThreadBlock * b_zp_k;
-    for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * b_zp_k;
+  static_assert(!direct_scales || (std::is_same_v<T, half> && block_size == 32 && !has_zero_point));
+  static_assert(max_unroll == 4 || max_unroll == 16);
+  const T* b_scale_vec;
+  uint8_t* b_zp_vec = nullptr;
+  if constexpr (direct_scales) {
+    // A warp owns one output column and can read its scales directly. Keeping the original
+    // arithmetic and reduction order allows a bitwise comparison with the staged kernel.
+    b_scale_vec = scales_data + n_id * blocks_per_K;
+  } else {
+    extern __shared__ char shared_buffer[];
+    T* staged_scales = reinterpret_cast<T*>(shared_buffer);
+    const int offset = n_block_id * kColsPerThreadBlock * blocks_per_K;
+    for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * blocks_per_K;
          i += kColsPerThreadBlock * kWarpSize) {
-      b_zp_vec[2 * i] = (zero_points[zp_offset + i] & 0x0f);
-      b_zp_vec[2 * i + 1] = (zero_points[zp_offset + i] >> 4);
+      staged_scales[i] = scales_data[offset + i];
     }
-    b_zp_vec += warp_id * b_zp_k * 2;
+
+    if constexpr (has_zero_point) {
+      b_zp_vec = reinterpret_cast<uint8_t*>(staged_scales + kColsPerThreadBlock * blocks_per_K);
+      const int b_zp_k = (blocks_per_K + 1) / 2;
+      const int zp_offset = n_block_id * kColsPerThreadBlock * b_zp_k;
+      for (int i = warp_id * kWarpSize + lane_id; i < kColsPerThreadBlock * b_zp_k;
+           i += kColsPerThreadBlock * kWarpSize) {
+        b_zp_vec[2 * i] = (zero_points[zp_offset + i] & 0x0f);
+        b_zp_vec[2 * i + 1] = (zero_points[zp_offset + i] >> 4);
+      }
+      b_zp_vec += warp_id * b_zp_k * 2;
+    }
+    __syncthreads();
+    b_scale_vec = staged_scales + warp_id * blocks_per_K;
   }
-  __syncthreads();
 
   a_data += m_id * k + (lane_id << 3);
-  b_scale_vec += warp_id * blocks_per_K;
 
   T sums[8] = {0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f, 0.f};
   int k_id = 0;
@@ -83,8 +95,10 @@ __global__ void __launch_bounds__(kWarpSize* kColsPerThreadBlock) MatMulFloat4Bi
     }                                                                                             \
   } while (false)
 
-  UnRollReduction(16);
-  UnRollReduction(4);
+  UnRollReduction(max_unroll);
+  if constexpr (max_unroll == 16) {
+    UnRollReduction(4);
+  }
   UnRollReduction(1);
 #undef UnRollReduction
 
@@ -134,6 +148,23 @@ bool TryMatMul4BitsM1(
 
   dim3 blocks((n + kColsPerThreadBlock - 1) / kColsPerThreadBlock, 1);
   dim3 threads(onnxruntime::cuda::GPU_WARP_SIZE_HOST, kColsPerThreadBlock);
+  if constexpr (std::is_same_v<T, half>) {
+    // Read once per process, outside the steady-state launch path. Separate processes are used
+    // for baseline/candidate comparisons so a session cannot change an already captured graph.
+    static const int experiment = ParseEnvironmentVariableWithDefault<int>("ORT_MATMUL4BITS_M1_EXPERIMENT", 0);
+    const int direct_unroll = SelectMatMul4BitsM1DirectUnroll(experiment, n, k, block_size, zero_points != nullptr);
+    if (direct_unroll == 4) {
+      MatMulFloat4BitsKernelM1<T, 32, false, true, 4><<<blocks, threads, 0, stream>>>(
+          output, a_data, b_data_quant, scales_data, nullptr, 1, n, k, blocks_per_K);
+      return true;
+    }
+    if (direct_unroll == 16) {
+      MatMulFloat4BitsKernelM1<T, 32, false, true, 16><<<blocks, threads, 0, stream>>>(
+          output, a_data, b_data_quant, scales_data, nullptr, 1, n, k, blocks_per_K);
+      return true;
+    }
+  }
+
 #define MATMUL_FLOAT4B_M1_DISPATCH(bs)                                                    \
   if (zero_points != nullptr) {                                                           \
     MatMulFloat4BitsKernelM1<T, bs, true><<<blocks, threads, shared_mem_size, stream>>>(  \
