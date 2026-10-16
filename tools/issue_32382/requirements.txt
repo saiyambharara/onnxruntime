@@ -1,0 +1,13 @@
+# Python 3.12; install the custom ORT wheel separately with --no-deps.
+numpy==2.5.3
+onnx==1.23.2
+protobuf==7.36.2
+ml_dtypes==0.6.0
+typing_extensions==4.16.0
+flatbuffers==25.12.19
+packaging==26.3
+nvidia-cuda-runtime==13.1.80
+nvidia-cuda-cupti==13.1.115
+nvidia-cuda-nvrtc==13.1.115
+nvidia-cublas==13.1.1.3
+nvidia-cudnn-cu13==9.20.0.48
