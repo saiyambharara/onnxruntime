@@ -30,8 +30,11 @@ parser.add_argument("--worker", action="store_true")
 parser.add_argument("--shape", default="3072,1024")
 parser.add_argument("--output", type=Path)
 parser.add_argument("--rounds", type=int, default=20)
+parser.add_argument("--intra-op-threads", type=int, default=0, help="ORT host threads; 0 preserves automatic selection")
 parser.add_argument("--shapes", default="3072,1024;4096,256;3072,3072;3072,8192;8192,3072;3072,32000")
 args = parser.parse_args()
+if args.intra_op_threads < 0:
+    parser.error("--intra-op-threads must be nonnegative")
 PREFIX = "ORT_WORKER:"
 
 
@@ -99,6 +102,10 @@ def worker():
     )
     model.ir_version = 10
     options = ort.SessionOptions()
+    options.intra_op_num_threads = args.intra_op_threads
+    if args.intra_op_threads:
+        options.inter_op_num_threads = 1
+        options.add_session_config_entry("session.intra_op.allow_spinning", "0")
     options.graph_optimization_level = ort.GraphOptimizationLevel.ORT_DISABLE_ALL
     options.add_session_config_entry("session.disable_cpu_ep_fallback", "1")
     options.add_session_config_entry("ep.cuda.fpa_intb_gemm", "0")
@@ -138,6 +145,7 @@ def worker():
             "ort_version": ort.__version__,
             "mode": os.environ["ORT_MATMUL4BITS_M1_EXPERIMENT"],
             "nodes_per_graph": nodes_per_graph,
+            "intra_op_threads": args.intra_op_threads,
             "output_sha256": hashlib.sha256(output.tobytes()).hexdigest(),
         }
     )
@@ -184,8 +192,14 @@ def master():
         "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
         "rounds": args.rounds,
         "graph_nodes": 500,
+        "intra_op_threads": args.intra_op_threads,
+        "harness_commit": subprocess.check_output(
+            ["git", "rev-parse", "HEAD"], cwd=Path(__file__).resolve().parent, text=True
+        ).strip(),
         "rows": [],
     }
+    with (Path(ort.__file__).parent / "capi/libonnxruntime_providers_cuda.so").open("rb") as stream:
+        document["provider_sha256"] = hashlib.file_digest(stream, "sha256").hexdigest()
     started = time.perf_counter()
 
     def receive(process):
@@ -209,7 +223,15 @@ def master():
                 log = (args.output.parent / f"worker-{k}-{n}-mode-{mode}.log").open("w")
                 logs.append(log)
                 process = subprocess.Popen(
-                    [sys.executable, str(Path(__file__).resolve()), "--worker", "--shape", f"{k},{n}"],
+                    [
+                        sys.executable,
+                        str(Path(__file__).resolve()),
+                        "--worker",
+                        "--shape",
+                        f"{k},{n}",
+                        "--intra-op-threads",
+                        str(args.intra_op_threads),
+                    ],
                     env=dict(os.environ, ORT_FPA_INTB_GEMM="0", ORT_MATMUL4BITS_M1_EXPERIMENT=str(mode)),
                     stdin=subprocess.PIPE,
                     stdout=subprocess.PIPE,

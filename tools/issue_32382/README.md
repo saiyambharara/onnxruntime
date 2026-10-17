@@ -103,6 +103,14 @@ and `--shapes` can reduce only the local smoke benchmark workload.
 
 ## One-hour early-testing limit
 
+For a CPU-contention cross-check, `benchmark.py --intra-op-threads 1` uses one
+ORT intra-op/inter-op thread and disables intra-op spinning. The default 0 keeps
+automatic thread selection. Worker subprocesses inherit the selected option.
+The standalone benchmark records its harness Git commit, provider SHA256 and
+thread setting, allowing the same compiled kernels to be compared across host
+thread settings. Use a new output directory and verify the provider hash against
+the compiled manifest; a newer harness commit does not relabel the runtime build.
+
 Budget at most ten minutes for setup/driver checks, up to 45 minutes for the
 bounded suite and a small optional profiling pass, and five minutes for cleanup.
 Treat setup failure or missing kernel traces as a failed/inconclusive gate;
